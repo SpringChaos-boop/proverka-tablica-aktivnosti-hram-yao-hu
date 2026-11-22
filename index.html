@@ -1,0 +1,1174 @@
+/**
+ * ПРОВЕРКА И ЧИСТКА ФРАКЦИЙ CATWAR
+ *
+ * Основные функции:
+ * 1. checkCatWarFactions() — проверка игроков.
+ * 2. deleteMarkedParticipants() — удаление строк со статусом «На чистку».
+ * 3. restoreArchivedParticipant() — восстановление строки из архива.
+ */
+
+const SHEET_CONFIG = {
+  'Общая активность': { ranges: ['B4:B100'] }
+};
+
+const CATWAR_SETTINGS = {
+  TARGET_FACTION: 'Санта-Муэрте',
+  PROFILE_URL: 'https://catwar.su/cat',
+  RESULTS_SHEET: 'Результаты проверки',
+  ARCHIVE_SHEET: 'Архив удалённых',
+  BATCH_SIZE: 30
+};
+
+const RESULT_HEADERS = [
+  'Исходный лист',
+  'Строка',
+  'ID игрока',
+  'Найденная фракция',
+  'Результат проверки',
+  'Профиль',
+  'Причина проверки',
+  'Действие',
+  'Дата действия'
+];
+
+const ARCHIVE_HEADERS = [
+  'Исходный лист',
+  'Исходная строка',
+  'ID игрока',
+  'Фракция',
+  'Дата удаления',
+  'Статус архива',
+  'Данные строки (служебное поле)',
+  'Формулы строки (служебное поле)'
+];
+
+const CATWAR_COLORS = {
+  title: '#5b4a42',
+  header: '#d9d5d2',
+  section: '#e8e3df',
+  neutral: '#f7f5f3',
+  white: '#ffffff',
+  text: '#333333',
+  border: '#b7b7b7',
+
+  clean: '#f4cccc',
+  manual: '#fff2cc',
+  normal: '#d9ead3',
+
+  red: '#f4cccc',
+  redText: '#990000',
+  yellow: '#fff2cc',
+  yellowText: '#7f6000',
+  green: '#d9ead3',
+  greenText: '#274e13'
+};
+
+
+/* =========================================================
+ * 1. ПРОВЕРКА ФРАКЦИЙ
+ * ======================================================= */
+
+function checkCatWarFactions() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (!ss) {
+    throw new Error('Не удалось получить активную таблицу.');
+  }
+
+  const results = [];
+  const players = [];
+  const missingSheets = [];
+
+  Object.keys(SHEET_CONFIG).forEach(function (sheetName) {
+    const sheet = ss.getSheetByName(sheetName);
+
+    if (!sheet) {
+      missingSheets.push(sheetName);
+
+      results.push(makeResult_({
+        sheetName: sheetName,
+        row: '',
+        id: '',
+        faction: '',
+        status: 'Ручная проверка',
+        reason: 'Лист не найден. Проверь название вкладки.'
+      }));
+
+      return;
+    }
+
+    const seenIds = {};
+
+    SHEET_CONFIG[sheetName].ranges.forEach(function (a1Range) {
+      const range = sheet.getRange(a1Range);
+      const values = range.getDisplayValues();
+      const firstRow = range.getRow();
+
+      values.forEach(function (rowValues, index) {
+        const id = normalizeCatWarId_(rowValues[0]);
+
+        if (!id) {
+          return;
+        }
+
+        const sourceRow = firstRow + index;
+
+        if (seenIds[id]) {
+          results.push(makeResult_({
+            sheetName: sheetName,
+            row: sourceRow,
+            id: id,
+            faction: '',
+            status: 'Ручная проверка',
+            reason: 'Этот ID уже встречался на листе. Проверь дубликат.'
+          }));
+
+          return;
+        }
+
+        seenIds[id] = true;
+
+        players.push({
+          sheetName: sheetName,
+          row: sourceRow,
+          id: id
+        });
+      });
+    });
+  });
+
+  const batchSize = Math.max(
+    1,
+    Number(CATWAR_SETTINGS.BATCH_SIZE) || 30
+  );
+
+  for (let start = 0; start < players.length; start += batchSize) {
+    const batch = players.slice(start, start + batchSize);
+
+    const requests = batch.map(function (player) {
+      return {
+        url: CATWAR_SETTINGS.PROFILE_URL + player.id,
+        method: 'get',
+        muteHttpExceptions: true,
+        followRedirects: true,
+        headers: {
+          'User-Agent': 'Mozilla/5.0'
+        }
+      };
+    });
+
+    let responses;
+
+    try {
+      responses = UrlFetchApp.fetchAll(requests);
+    } catch (error) {
+      batch.forEach(function (player) {
+        results.push(makeResult_({
+          sheetName: player.sheetName,
+          row: player.row,
+          id: player.id,
+          faction: '',
+          status: 'Ручная проверка',
+          reason: 'Не удалось получить данные CatWar: ' +
+            error.message
+        }));
+      });
+
+      continue;
+    }
+
+    responses.forEach(function (response, index) {
+      const player = batch[index];
+      const httpCode = response.getResponseCode();
+
+      if (httpCode < 200 || httpCode >= 300) {
+        results.push(makeResult_({
+          sheetName: player.sheetName,
+          row: player.row,
+          id: player.id,
+          faction: '',
+          status: 'Ручная проверка',
+          reason: 'Профиль вернул HTTP ' + httpCode
+        }));
+
+        return;
+      }
+
+      const html = response.getContentText();
+
+      const faction = extractCatWarFaction_(html);
+      const universe = extractCatWarUniverse_(html);
+
+      if (!faction) {
+        if (universe === 'Озёрная вселенная') {
+          results.push(makeResult_({
+            sheetName: player.sheetName,
+            row: player.row,
+            id: player.id,
+            faction: '',
+            status: 'На чистку',
+            reason: 'Фракция скрыта, обнаружена Озёрная вселенная.'
+          }));
+        } else {
+          let reason = 'Не удалось определить фракцию по профилю.';
+
+          if (universe) {
+            reason += ' Обнаружена вселенная: ' + universe + '.';
+          }
+
+          results.push(makeResult_({
+            sheetName: player.sheetName,
+            row: player.row,
+            id: player.id,
+            faction: '',
+            status: 'Ручная проверка',
+            reason: reason
+          }));
+        }
+
+        return;
+      }
+
+      if (faction === CATWAR_SETTINGS.TARGET_FACTION) {
+        // Игроки целевой фракции в список чистки не попадают.
+        return;
+      }
+
+      results.push(makeResult_({
+        sheetName: player.sheetName,
+        row: player.row,
+        id: player.id,
+        faction: faction,
+        status: 'На чистку',
+        reason: 'Фракция не совпадает с целевой.'
+      }));
+    });
+  }
+
+  let resultsSheet = ss.getSheetByName(
+  CATWAR_SETTINGS.RESULTS_SHEET
+);
+
+if (!resultsSheet) {
+  resultsSheet = ss.insertSheet(
+    CATWAR_SETTINGS.RESULTS_SHEET
+  );
+}
+
+renderCatWarResults_(resultsSheet, results);
+
+  Logger.log(
+    'Проверка завершена. Игроков обработано: ' + players.length +
+    '; записей в результатах: ' + results.length +
+    '; отсутствующих листов: ' + missingSheets.length
+  );
+}
+
+
+/* =========================================================
+ * 2. ПАРСИНГ ПРОФИЛЯ CATWAR
+ * ======================================================= */
+
+function normalizeCatWarId_(value) {
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  const text = String(value).trim();
+
+  // Поддерживает обычный ID и записи наподобие [1705280]
+  // или [link1705280].
+  const match = text.match(/\d+/);
+
+  return match ? match[0] : '';
+}
+
+
+function extractCatWarFaction_(html) {
+  if (!html) {
+    return '';
+  }
+
+  /*
+   * Находит строку таблицы, содержащую изображение
+   * с атрибутом title="Племя", после чего читает
+   * текст следующей ячейки.
+   */
+  const rowMatch = html.match(
+    /<tr\b[^>]*>(?:(?!<tr\b)[\s\S])*?<img\b(?=[^>]*\btitle\s*=\s*(['"])Племя\1)[^>]*>(?:(?!<\/tr>)[\s\S])*?<\/tr>/i
+  );
+
+  if (!rowMatch) {
+    return '';
+  }
+
+  const rowHtml = rowMatch[0];
+
+  const cells = Array.from(
+    rowHtml.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)
+  );
+
+  for (let i = 0; i < cells.length; i++) {
+    const currentCell = cells[i][1];
+
+    if (
+      !/<img\b[^>]*\btitle\s*=\s*(['"])Племя\1/i.test(currentCell)
+    ) {
+      continue;
+    }
+
+    if (i + 1 >= cells.length) {
+      return '';
+    }
+
+    return cleanCatWarHtmlText_(cells[i + 1][1]);
+  }
+
+  return '';
+}
+
+
+function extractCatWarUniverse_(html) {
+  if (!html) {
+    return '';
+  }
+
+  const match = html.match(
+    /<img\b[^>]*\b(?:alt|title)\s*=\s*(['"])(Озёрная вселенная|Вселенная творцов)\1/i
+  );
+
+  return match ? match[2] : '';
+}
+
+
+function cleanCatWarHtmlText_(html) {
+  if (!html) {
+    return '';
+  }
+
+  return String(html)
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+/* =========================================================
+ * 3. ФОРМИРОВАНИЕ РЕЗУЛЬТАТОВ
+ * ======================================================= */
+
+function makeResult_(data) {
+  return {
+    sheetName: data.sheetName || '',
+    row: data.row === undefined ? '' : data.row,
+    id: data.id || '',
+    faction: data.faction || '',
+    status: data.status || 'Ручная проверка',
+    reason: data.reason || ''
+  };
+}
+
+
+
+
+
+function renderCatWarResults_(sheet, records) {
+  sheet.getDataRange().breakApart();
+  sheet.clear();
+
+  const width = RESULT_HEADERS.length;
+  const output = [
+    ['Результаты проверки'],
+    RESULT_HEADERS.slice()
+  ];
+
+  const sectionRows = [];
+  const statusRows = [];
+  let currentSheet = null;
+
+  records.forEach(record => {
+    if (record.sheetName !== currentSheet) {
+      currentSheet = record.sheetName;
+      sectionRows.push(output.length + 1);
+      output.push(['ЛИСТ: ' + currentSheet]);
+    }
+
+    let profile = '';
+
+    if (record.id) {
+      const url = CATWAR_SETTINGS.PROFILE_URL + record.id;
+      const safeUrl = url.replace(/"/g, '""');
+      profile = '=HYPERLINK("' + safeUrl + '";"Открыть профиль")';
+    }
+
+    output.push([
+      record.sheetName || '',
+      record.row === undefined ? '' : record.row,
+      record.id || '',
+      record.faction || '',
+      record.status || '',
+      profile,
+      record.reason || '',
+      record.action || '',
+      record.actionDate || ''
+    ]);
+
+    statusRows.push({
+      row: output.length,
+      status: record.status || '',
+      action: record.action || ''
+    });
+  });
+
+  const padded = output.map(row => {
+    const copy = row.slice();
+    while (copy.length < width) copy.push('');
+    return copy;
+  });
+
+  // Записываем весь результат одной операцией.
+  sheet.getRange(1, 1, padded.length, width).setValues(padded);
+
+  // Общий заголовок.
+  sheet.getRange(1, 1, 1, width).merge()
+    .setBackground(CATWAR_COLORS.title)
+    .setFontColor(CATWAR_COLORS.white)
+    .setFontWeight('bold')
+    .setFontSize(14)
+    .setVerticalAlignment('middle');
+
+  sheet.setRowHeight(1, 36);
+
+  // Заголовки столбцов.
+  sheet.getRange(2, 1, 1, width)
+    .setBackground(CATWAR_COLORS.header)
+    .setFontColor(CATWAR_COLORS.text)
+    .setFontWeight('bold')
+    .setWrap(true)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
+
+  sheet.setRowHeight(2, 40);
+  sheet.setFrozenRows(2);
+
+  if (padded.length > 2) {
+    const rowCount = padded.length - 2;
+    const backgrounds = [];
+    const fontColors = [];
+
+    // Подготавливаем оформление всех строк в памяти.
+    for (let row = 3; row <= padded.length; row++) {
+      const sectionIndex = sectionRows.indexOf(row);
+
+      if (sectionIndex !== -1) {
+        backgrounds.push(
+          Array(width).fill(CATWAR_COLORS.section)
+        );
+        fontColors.push(
+          Array(width).fill(CATWAR_COLORS.text)
+        );
+      } else {
+        backgrounds.push(
+          Array(width).fill(
+            row % 2 === 0
+              ? CATWAR_COLORS.neutral
+              : CATWAR_COLORS.white
+          )
+        );
+        fontColors.push(
+          Array(width).fill(CATWAR_COLORS.text)
+        );
+      }
+    }
+
+    // Один вызов для основного фона таблицы.
+    sheet.getRange(3, 1, rowCount, width)
+      .setBackgrounds(backgrounds)
+      .setFontColors(fontColors)
+      .setVerticalAlignment('middle')
+      .setWrap(true);
+
+    // Высота строк задаётся блоком.
+    sheet.setRowHeights(3, rowCount, 32);
+
+    // Объединяем строки-разделы.
+    sectionRows.forEach(row => {
+      sheet.getRange(row, 1, 1, width).merge()
+        .setFontWeight('bold')
+        .setVerticalAlignment('middle');
+
+      sheet.setRowHeight(row, 29);
+    });
+
+    // Оформление статусов и действий.
+    const statusBackgrounds = [];
+    const statusFontColors = [];
+
+    statusRows.forEach(item => {
+      let fill = CATWAR_COLORS.white;
+      let font = CATWAR_COLORS.text;
+
+      if (item.status === 'На чистку') {
+        fill = CATWAR_COLORS.red;
+        font = CATWAR_COLORS.redText;
+      } else if (item.status === 'Ручная проверка') {
+        fill = CATWAR_COLORS.yellow;
+        font = CATWAR_COLORS.yellowText;
+      } else if (item.status === 'Оставить') {
+        fill = CATWAR_COLORS.green;
+        font = CATWAR_COLORS.greenText;
+      }
+
+      statusBackgrounds.push([fill]);
+      statusFontColors.push([font]);
+
+      if (
+        item.action === 'Удалён из таблицы' ||
+        item.action === 'Удалён'
+      ) {
+        sheet.getRange(item.row, 8)
+          .setBackground(CATWAR_COLORS.section)
+          .setFontWeight('bold');
+      }
+    });
+
+    // Цвета статусов записываем непрерывными блоками,
+    // исключая строки-разделы.
+    let start = 0;
+
+    while (start < statusRows.length) {
+      let end = start + 1;
+
+      while (
+        end < statusRows.length &&
+        statusRows[end].row === statusRows[end - 1].row + 1
+      ) {
+        end++;
+      }
+
+      const count = end - start;
+
+      sheet.getRange(statusRows[start].row, 5, count, 1)
+        .setBackgrounds(statusBackgrounds.slice(start, end))
+        .setFontColors(statusFontColors.slice(start, end))
+        .setFontWeight('bold')
+        .setHorizontalAlignment('center');
+
+      start = end;
+    }
+  }
+
+  // Ширина столбцов.
+  const widths = [180, 75, 110, 165, 155, 145, 240, 155, 145];
+
+  widths.forEach((value, index) => {
+    sheet.setColumnWidth(index + 1, value);
+  });
+
+  sheet.getDataRange()
+    .setBorder(
+      true, true, true, true, true, true,
+      CATWAR_COLORS.border,
+      SpreadsheetApp.BorderStyle.SOLID
+    )
+    .setFontFamily('Arial')
+    .setFontSize(10);
+}
+
+
+/* =========================================================
+ * 4. УДАЛЕНИЕ СТРОК
+ * ======================================================= */
+
+function deleteMarkedParticipants() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const resultSheet = ss.getSheetByName(
+    CATWAR_SETTINGS.RESULTS_SHEET
+  );
+
+  if (!resultSheet || resultSheet.getLastRow() < 3) {
+    Logger.log('Нет результатов для удаления.');
+    return;
+  }
+
+  const data = resultSheet.getDataRange().getValues();
+  const targets = [];
+
+  // Первые две строки — заголовок и названия столбцов.
+  for (let i = 2; i < data.length; i++) {
+    const row = data[i];
+
+    const sheetName = String(row[0] || '').trim();
+    const sourceRow = Number(row[1]);
+    const id = normalizeCatWarId_(row[2]);
+    const status = String(row[4] || '').trim();
+    const action = String(row[7] || '').trim();
+
+    // Пропускает строки-заголовки, пустые строки,
+    // уже обработанные записи и статусы ручной проверки.
+    if (
+      status === 'На чистку' &&
+      !action &&
+      sheetName &&
+      Number.isInteger(sourceRow) &&
+      sourceRow > 0 &&
+      id
+    ) {
+      targets.push({
+        sheetName: sheetName,
+        row: sourceRow,
+        id: id,
+        resultRow: i + 1
+      });
+    }
+  }
+
+  if (!targets.length) {
+    Logger.log(
+      'Нет необработанных строк со статусом «На чистку».'
+    );
+    return;
+  }
+
+  // Резервная копия создаётся один раз перед удалением.
+  let backupFile;
+
+  try {
+    const timestamp = Utilities.formatDate(
+  new Date(),
+  'GMT',
+  'yyyy-MM-dd_HH-mm-ss'
+);
+
+    backupFile = DriveApp.getFileById(ss.getId()).makeCopy(
+      ss.getName() + ' — резервная копия перед чисткой — ' + timestamp
+    );
+  } catch (error) {
+    Logger.log(
+      'Удаление отменено: не удалось создать резервную копию. ' +
+      error.message
+    );
+    return;
+  }
+
+  let archiveSheet;
+
+  try {
+    archiveSheet = getOrCreateArchiveSheet_(ss);
+  } catch (error) {
+    Logger.log(
+      'Удаление отменено: не удалось подготовить архив. ' +
+      error.message
+    );
+    return;
+  }
+
+  // Сначала удаляет нижние строки каждого листа,
+  // чтобы номера верхних строк не смещались.
+  targets.sort(function (a, b) {
+    if (a.sheetName !== b.sheetName) {
+      return a.sheetName.localeCompare(b.sheetName);
+    }
+
+    return b.row - a.row;
+  });
+
+  let deleted = 0;
+  let skipped = 0;
+
+  targets.forEach(function (target) {
+    const sourceSheet = ss.getSheetByName(target.sheetName);
+
+    if (!sourceSheet || target.row > sourceSheet.getMaxRows()) {
+      updateResultAction_(
+        resultSheet,
+        target.resultRow,
+        'Не удалён: лист или строка не найдены.'
+      );
+
+      skipped++;
+      return;
+    }
+
+    try {
+      const idColumn = findConfiguredIdColumn_(
+        target.sheetName,
+        target.row
+      );
+
+      const currentId = normalizeCatWarId_(
+        sourceSheet.getRange(target.row, idColumn).getDisplayValue()
+      );
+
+      // Защита от удаления чужой строки после изменения таблицы.
+      if (currentId !== target.id) {
+        updateResultAction_(
+          resultSheet,
+          target.resultRow,
+          'Не удалён: ID в исходной строке изменился.'
+        );
+
+        skipped++;
+        return;
+      }
+
+      const lastColumn = Math.max(
+        sourceSheet.getLastColumn(),
+        idColumn,
+        1
+      );
+
+      const sourceRange = sourceSheet.getRange(
+        target.row,
+        1,
+        1,
+        lastColumn
+      );
+
+      const rowValues = sourceRange.getValues()[0];
+      const rowFormulas = sourceRange.getFormulas()[0];
+
+      const archiveRow = appendArchiveRecord_(
+        archiveSheet,
+        target.sheetName,
+        target.row,
+        target.id,
+        '',
+        rowValues,
+        rowFormulas,
+        'Подготовлено'
+      );
+
+      try {
+        sourceSheet.deleteRow(target.row);
+
+        archiveSheet.getRange(archiveRow, 5).setValue(new Date());
+        archiveSheet.getRange(archiveRow, 6).setValue('Удалён');
+
+        updateResultAction_(
+          resultSheet,
+          target.resultRow,
+          'Удалён из таблицы',
+          new Date()
+        );
+
+        deleted++;
+      } catch (deleteError) {
+        archiveSheet.getRange(archiveRow, 6).setValue(
+          'Ошибка удаления: ' + deleteError.message
+        );
+
+        updateResultAction_(
+          resultSheet,
+          target.resultRow,
+          'Ошибка удаления: ' + deleteError.message
+        );
+
+        skipped++;
+      }
+    } catch (error) {
+      updateResultAction_(
+        resultSheet,
+        target.resultRow,
+        'Ошибка: ' + error.message
+      );
+
+      skipped++;
+    }
+  });
+
+  Logger.log(
+    'Чистка завершена. Удалено: ' + deleted +
+    '; пропущено или завершилось ошибкой: ' + skipped +
+    '; резервная копия: ' + backupFile.getName()
+  );
+}
+
+
+function findConfiguredIdColumn_(sheetName, sourceRow) {
+  const config = SHEET_CONFIG[sheetName];
+
+  if (!config || !config.ranges || !config.ranges.length) {
+    throw new Error(
+      'Для листа "' + sheetName + '" не настроен столбец ID.'
+    );
+  }
+
+  for (let i = 0; i < config.ranges.length; i++) {
+    const a1Range = config.ranges[i];
+    const range = a1Range.match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i);
+
+    if (!range) {
+      continue;
+    }
+
+    const firstColumn = columnLetterToNumber_(range[1]);
+    const firstRow = Number(range[2]);
+    const lastColumn = columnLetterToNumber_(range[3]);
+    const lastRow = Number(range[4]);
+
+    if (sourceRow >= firstRow && sourceRow <= lastRow) {
+      if (firstColumn !== lastColumn) {
+        throw new Error(
+          'Диапазон ' + a1Range +
+          ' должен содержать один столбец.'
+        );
+      }
+
+      return firstColumn;
+    }
+  }
+
+  throw new Error(
+    'Строка ' + sourceRow +
+    ' не входит в настроенные диапазоны листа "' + sheetName + '".'
+  );
+}
+
+
+function columnLetterToNumber_(letters) {
+  let result = 0;
+  const text = String(letters).toUpperCase();
+
+  for (let i = 0; i < text.length; i++) {
+    result = result * 26 + text.charCodeAt(i) - 64;
+  }
+
+  return result;
+}
+
+
+function updateResultAction_(
+  resultSheet,
+  row,
+  action,
+  actionDate
+) {
+  // H — действие, I — дата действия.
+  resultSheet.getRange(row, 8).setValue(action || '');
+
+  if (actionDate) {
+    resultSheet.getRange(row, 9).setValue(actionDate);
+  }
+}
+
+
+/* =========================================================
+ * 5. АРХИВ
+ * ======================================================= */
+
+function getOrCreateArchiveSheet_(ss) {
+  const sheet = getOrCreateSheet_(
+    ss,
+    CATWAR_SETTINGS.ARCHIVE_SHEET
+  );
+
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, ARCHIVE_HEADERS.length)
+      .setValues([ARCHIVE_HEADERS])
+      .setFontWeight('bold')
+      .setBackground(CATWAR_COLORS.header);
+
+    sheet.setFrozenRows(1);
+    sheet.setColumnWidth(1, 230);
+    sheet.setColumnWidth(2, 110);
+    sheet.setColumnWidth(3, 110);
+    sheet.setColumnWidth(4, 180);
+    sheet.setColumnWidth(5, 160);
+    sheet.setColumnWidth(6, 180);
+
+    sheet.hideColumns(7, 2);
+  }
+
+  return sheet;
+}
+
+
+function appendArchiveRecord_(
+  archiveSheet,
+  sheetName,
+  originalRow,
+  id,
+  faction,
+  rowValues,
+  rowFormulas,
+  status
+) {
+  const archiveRow = Math.max(archiveSheet.getLastRow() + 1, 2);
+
+  archiveSheet.getRange(
+    archiveRow,
+    1,
+    1,
+    ARCHIVE_HEADERS.length
+  ).setValues([[
+    sheetName,
+    originalRow,
+    id,
+    faction || '',
+    '',
+    status || 'Подготовлено',
+    JSON.stringify(rowValues.map(encodeArchiveValue_)),
+    JSON.stringify(rowFormulas)
+  ]]);
+
+  return archiveRow;
+}
+
+
+function encodeArchiveValue_(value) {
+  if (value instanceof Date) {
+    return {
+      __type: 'Date',
+      value: value.toISOString()
+    };
+  }
+
+  return value;
+}
+
+
+function decodeArchiveValue_(value) {
+  if (
+    value &&
+    typeof value === 'object' &&
+    value.__type === 'Date' &&
+    value.value
+  ) {
+    return new Date(value.value);
+  }
+
+  return value;
+}
+
+
+/* =========================================================
+ * 6. ВОССТАНОВЛЕНИЕ ИЗ АРХИВА
+ * ======================================================= */
+
+
+function restoreArchivedParticipant() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const archiveSheet = ss.getSheetByName(
+    CATWAR_SETTINGS.ARCHIVE_SHEET
+  );
+
+  if (!archiveSheet || archiveSheet.getLastRow() < 2) {
+    ss.toast('Архив пуст. Восстанавливать нечего.', 'CatWar', 5);
+    return;
+  }
+
+  // Восстанавливаем запись, на которой находится курсор.
+  const activeSheet = ss.getActiveSheet();
+  const activeRange = ss.getActiveRange();
+
+  if (
+    !activeSheet ||
+    activeSheet.getName() !== CATWAR_SETTINGS.ARCHIVE_SHEET ||
+    !activeRange
+  ) {
+    ss.toast(
+      'Открой лист «Архив удалённых» и выбери запись для восстановления.',
+      'CatWar',
+      6
+    );
+    return;
+  }
+
+  const archiveRow = activeRange.getRow();
+
+  if (archiveRow < 2 || archiveRow > archiveSheet.getLastRow()) {
+    ss.toast(
+      'Выбери строку с записью участника, а не заголовок.',
+      'CatWar',
+      5
+    );
+    return;
+  }
+
+  const record = archiveSheet.getRange(
+    archiveRow,
+    1,
+    1,
+    ARCHIVE_HEADERS.length
+  ).getValues()[0];
+
+  const sheetName = String(record[0] || '').trim();
+  const originalRow = Number(record[1]);
+  const id = normalizeCatWarId_(record[2]);
+  const faction = record[3] || '';
+  const status = String(record[5] || '').trim();
+
+  if (status !== 'Удалён') {
+    ss.toast(
+      'Восстановление невозможно. Статус записи: ' + status,
+      'CatWar',
+      6
+    );
+    return;
+  }
+
+  const sourceSheet = ss.getSheetByName(sheetName);
+
+  if (!sourceSheet) {
+    ss.toast(
+      'Исходный лист «' + sheetName + '» не найден.',
+      'CatWar',
+      6
+    );
+    return;
+  }
+
+  if (!Number.isInteger(originalRow) || originalRow < 1 || !id) {
+    ss.toast(
+      'В архивной записи отсутствуют корректные данные.',
+      'CatWar',
+      6
+    );
+    return;
+  }
+
+  let values;
+  let formulas;
+
+  try {
+    values = JSON.parse(record[6]).map(decodeArchiveValue_);
+    formulas = JSON.parse(record[7]);
+  } catch (error) {
+    ss.toast(
+      'Не удалось прочитать архив: ' + error.message,
+      'CatWar',
+      6
+    );
+    return;
+  }
+
+  if (!Array.isArray(values) || !Array.isArray(formulas)) {
+    ss.toast('Данные строки в архиве повреждены.', 'CatWar', 6);
+    return;
+  }
+
+  // Учитывает другие удалённые записи перед исходной строкой.
+  const archiveData = archiveSheet.getDataRange().getValues();
+  let earlierDeletedRows = 0;
+
+  for (let i = 1; i < archiveData.length; i++) {
+    const other = archiveData[i];
+
+    if (
+      i + 1 !== archiveRow &&
+      String(other[0] || '').trim() === sheetName &&
+      String(other[5] || '').trim() === 'Удалён' &&
+      Number(other[1]) < originalRow
+    ) {
+      earlierDeletedRows++;
+    }
+  }
+
+  const insertAt = Math.max(1, originalRow - earlierDeletedRows);
+
+  try {
+    if (insertAt > sourceSheet.getMaxRows()) {
+      sourceSheet.insertRowsAfter(
+        sourceSheet.getMaxRows(),
+        insertAt - sourceSheet.getMaxRows()
+      );
+    }
+
+    sourceSheet.insertRowsBefore(insertAt, 1);
+
+    const width = values.length;
+
+    if (width > sourceSheet.getMaxColumns()) {
+      sourceSheet.insertColumnsAfter(
+        sourceSheet.getMaxColumns(),
+        width - sourceSheet.getMaxColumns()
+      );
+    }
+
+    const destination = sourceSheet.getRange(
+      insertAt,
+      1,
+      1,
+      width
+    );
+
+    // Сначала восстанавливаем все сохранённые значения.
+    destination.setValues([values]);
+
+    // Затем возвращаем только реально существовавшие формулы.
+    // Пустые элементы формул не должны стирать обычные значения.
+    formulas.forEach(function (formula, index) {
+      if (formula) {
+        destination.getCell(1, index + 1).setFormula(formula);
+      }
+    });
+
+    // Статус меняется только после успешного восстановления.
+    archiveSheet.getRange(archiveRow, 6).setValue('Восстановлен');
+
+    ss.toast(
+      'Участник ' + id + ' восстановлен на лист «' +
+      sheetName + '», строка ' + insertAt + '.',
+      'CatWar',
+      7
+    );
+
+    Logger.log(
+      'Строка восстановлена. Лист: ' + sheetName +
+      '; строка: ' + insertAt +
+      '; ID: ' + id +
+      '; фракция в архиве: ' + faction
+    );
+  } catch (error) {
+    ss.toast(
+      'Ошибка восстановления: ' + error.message,
+      'CatWar',
+      8
+    );
+
+    Logger.log('Ошибка восстановления строки: ' + error.message);
+  }
+}
+
+/* =========================================================
+ * 7. ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+ * ======================================================= */
+
+function getOrCreateSheet_(ss, name) {
+  let sheet = ss.getSheetByName(name);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+
+  return sheet;
+}
+
+// =========================================================
+// 8. МЕНЮ CATWAR
+// =========================================================
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('CatWar')
+    .addItem('Проверить фракции', 'checkCatWarFactions')
+    .addSeparator()
+    .addItem('Удалить отмеченных', 'deleteMarkedParticipants')
+    .addItem('Восстановить выбранную запись', 'restoreArchivedParticipant')
+    .addSeparator()
+    .addItem('Перенести баллы в общую таблицу', 'scoreTransfer_transferScores')
+    .addItem('Откатить последний перенос', 'scoreTransfer_rollbackLast')
+    .addItem('Проверить доступ к таблицам', 'scoreTransfer_checkAccess')
+    .addToUi();
+}
